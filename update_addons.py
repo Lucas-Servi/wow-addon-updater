@@ -23,7 +23,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-USER_AGENT = "wow-addon-updater (https://github.com/Lservi/wow-addon-updater)"
+USER_AGENT = "wow-addon-updater (https://github.com/Lucas-Servi/wow-addon-updater)"
 STATE_FILENAME = ".addon-updater.json"
 
 STEAM_ROOTS = [
