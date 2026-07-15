@@ -1,0 +1,23 @@
+{
+  "Questie": {
+    "strategy": "github-release",
+    "repo": "Questie/Questie",
+    "asset": "^Questie-v[\\d.]+\\.zip$"
+  },
+  "Auctionator": {
+    "strategy": "github-source",
+    "repo": "TheMouseNest/Auctionator",
+    "tag_pattern": "build-number-(\\d+)",
+    "package_as": "Auctionator",
+    "ignore": [
+      ".github",
+      ".pkgmeta",
+      ".luarc.json",
+      "README.md",
+      "test-data",
+      "scripts",
+      "DB2_Scripts",
+      "annotations.lua"
+    ]
+  }
+}
