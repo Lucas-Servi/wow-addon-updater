@@ -188,6 +188,35 @@ def resolve_github_source(spec):
     return best
 
 
+def resolve_github_branch(spec):
+    """Return (version, zipball_url) for the tip of a branch (default branch if unset).
+
+    For projects that stopped tagging and release straight from their main
+    branch. The version is 'YYYY-MM-DD.shortsha' of the tip commit.
+    """
+    branch = spec.get("branch", "HEAD")
+    commit = http_json(f"https://api.github.com/repos/{spec['repo']}/commits/{branch}")
+    date = commit["commit"]["committer"]["date"][:10]
+    sha = commit["sha"]
+    return f"{date}.{sha[:7]}", f"https://api.github.com/repos/{spec['repo']}/zipball/{sha}"
+
+
+def pkgmeta_ignores(addon_dir):
+    """Read the 'ignore:' list from a repo's .pkgmeta, if present."""
+    pkgmeta = addon_dir / ".pkgmeta"
+    if not pkgmeta.is_file():
+        return []
+    ignores, in_ignore = [], False
+    for line in pkgmeta.read_text(errors="replace").splitlines():
+        if re.match(r"^\S", line):
+            in_ignore = line.startswith("ignore:")
+            continue
+        m = re.match(r"^\s+-\s+(\S+)", line)
+        if in_ignore and m:
+            ignores.append(m.group(1))
+    return ignores
+
+
 def fetch_addon(name, spec, workdir):
     """Download and extract an addon once per run.
 
@@ -199,6 +228,8 @@ def fetch_addon(name, spec, workdir):
         version, url = resolve_github_release(spec)
     elif strategy == "github-source":
         version, url = resolve_github_source(spec)
+    elif strategy == "github-branch":
+        version, url = resolve_github_branch(spec)
     else:
         raise ValueError(f"{name}: unknown strategy {strategy!r}")
 
@@ -208,13 +239,16 @@ def fetch_addon(name, spec, workdir):
     extract_dir.mkdir()
     safe_extract(zip_path, extract_dir)
 
-    if strategy == "github-source":
+    if strategy in ("github-source", "github-branch"):
         # The zipball has a single "<owner>-<repo>-<sha>" root; rename it to
-        # the addon folder name and strip files that only exist for development.
+        # the addon folder name and strip files that only exist for development:
+        # the repo's own .pkgmeta ignore list, any extra spec ignores, and
+        # top-level dotfiles.
         root = next(extract_dir.iterdir())
         addon_dir = extract_dir / spec["package_as"]
         root.rename(addon_dir)
-        for ignored in spec.get("ignore", []):
+        dotfiles = [p.name for p in addon_dir.iterdir() if p.name.startswith(".")]
+        for ignored in pkgmeta_ignores(addon_dir) + spec.get("ignore", []) + dotfiles:
             target = addon_dir / ignored
             if target.is_dir():
                 shutil.rmtree(target)
@@ -225,14 +259,20 @@ def fetch_addon(name, spec, workdir):
 
 
 def patch_toc(addon_dir, interface, version):
-    """Fill in the .toc fields that the addon's CI would normally generate."""
+    """Fill in the .toc fields that the addon's CI would normally generate.
+
+    The Interface line is only replaced when it doesn't already list this
+    client's interface number (repos increasingly keep a correct
+    multi-flavor list checked in). The Version line is only replaced when
+    it holds a build-time placeholder like @project-version@.
+    """
     for toc in addon_dir.glob("*.toc"):
         text = toc.read_text(errors="replace")
-        if interface:
-            text = re.sub(r"^## Interface:.*$", f"## Interface: {interface}",
-                          text, flags=re.MULTILINE)
-        text = re.sub(r"^## Version:.*$", f"## Version: {version}",
-                      text, flags=re.MULTILINE)
+        m = re.search(r"^## Interface:(.*)$", text, flags=re.MULTILINE)
+        if interface and m and str(interface) not in m.group(1):
+            text = text.replace(m.group(0), f"## Interface: {interface}")
+        text = re.sub(r"^## Version:.*(@[\w-]+@|AUTO_GENERATED_VERSION).*$",
+                      f"## Version: {version}", text, flags=re.MULTILINE)
         toc.write_text(text)
 
 
@@ -312,7 +352,7 @@ def update_flavor(flavor, registry, cache, workdir, dry_run):
         except OSError as e:
             print(f"    {name}: FAILED to install ({e})")
             continue
-        if spec["strategy"] == "github-source":
+        if spec["strategy"] in ("github-source", "github-branch"):
             patch_toc(flavor.addons_dir / spec["package_as"], flavor.interface, latest)
         state[name] = {"version": latest, "folders": folders}
         save_state(flavor.addons_dir, state)
@@ -326,6 +366,8 @@ def update_flavor(flavor, registry, cache, workdir, dry_run):
 def resolve_latest_version(spec):
     if spec["strategy"] == "github-release":
         return resolve_github_release(spec)[0]
+    if spec["strategy"] == "github-branch":
+        return resolve_github_branch(spec)[0]
     return resolve_github_source(spec)[0]
 
 

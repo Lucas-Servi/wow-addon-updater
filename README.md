@@ -74,24 +74,42 @@ Releases (the common case):
 `asset` is a regex matched against the release's asset filenames; the zip's
 top-level folders are copied into `Interface/AddOns`.
 
-**`github-source`** — for addons that only publish to CurseForge/Wago but keep
-their source on GitHub with no bundled external libraries:
+**`github-branch`** — for addons that only publish to CurseForge/Wago but keep
+their source on GitHub and release straight from their main branch:
 
 ```json
 "Auctionator": {
-  "strategy": "github-source",
+  "strategy": "github-branch",
   "repo": "TheMouseNest/Auctionator",
-  "tag_pattern": "build-number-(\\d+)",
-  "package_as": "Auctionator",
-  "ignore": [".github", "test-data", "scripts"]
+  "branch": "master",
+  "package_as": "Auctionator"
 }
 ```
 
-The newest tag matching `tag_pattern` (group 1 must be a sortable number) is
-downloaded as source, renamed to `package_as`, development-only paths in
-`ignore` are removed, and the `## Interface:` / `## Version:` lines in the
-`.toc` are filled in from your installed client's version (read from the
-game's own `.build.info` / `.flavor.info` files).
+The branch tip is downloaded as source and renamed to `package_as`.
+Development-only paths are removed automatically (the repo's own `.pkgmeta`
+`ignore:` list, top-level dotfiles, plus anything in an optional `"ignore"`
+array). In the `.toc`, a `## Version:` build placeholder like
+`@project-version@` is replaced with `YYYY-MM-DD.shortsha`, and the
+`## Interface:` line is filled in from your installed client's version (read
+from the game's own `.build.info` / `.flavor.info` files) — but only when the
+checked-in line doesn't already list your client.
+
+**`github-source`** — same packaging as `github-branch`, but pinned to the
+newest git tag matching a pattern instead of a branch tip. Use it only when a
+project's tags are actually kept current — a stale tag will silently get you
+years-old code:
+
+```json
+"SomeAddon": {
+  "strategy": "github-source",
+  "repo": "author/SomeAddon",
+  "tag_pattern": "v([\\d.]+)",
+  "package_as": "SomeAddon"
+}
+```
+
+`tag_pattern` group 1 must be a sortable number.
 
 ## Limitations
 

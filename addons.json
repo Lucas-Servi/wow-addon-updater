@@ -5,19 +5,9 @@
     "asset": "^Questie-v[\\d.]+\\.zip$"
   },
   "Auctionator": {
-    "strategy": "github-source",
+    "strategy": "github-branch",
     "repo": "TheMouseNest/Auctionator",
-    "tag_pattern": "build-number-(\\d+)",
-    "package_as": "Auctionator",
-    "ignore": [
-      ".github",
-      ".pkgmeta",
-      ".luarc.json",
-      "README.md",
-      "test-data",
-      "scripts",
-      "DB2_Scripts",
-      "annotations.lua"
-    ]
+    "branch": "master",
+    "package_as": "Auctionator"
   }
 }
