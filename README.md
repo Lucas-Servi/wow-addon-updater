@@ -36,7 +36,7 @@ need to run inside the same Wine prefix as the game. This tool instead:
 ## Usage
 
 ```bash
-git clone https://github.com/lucas-servi/wow-addon-updater
+git clone https://github.com/Lservi/wow-addon-updater
 cd wow-addon-updater
 ./update_addons.py --dry-run   # see what would happen
 ./update_addons.py             # update everything
