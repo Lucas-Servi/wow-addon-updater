@@ -297,6 +297,37 @@ class PackageSafetyTest(TempDirTestCase):
             u.toc_folders(source, allow_wrapper=True)
 
 
+class PatchTocTest(TempDirTestCase):
+    def test_all_folders_patched_for_multi_folder_source(self):
+        """A1: a source/branch addon shipping several folders must have EVERY
+        folder's .toc patched (Interface + Version), not just package_as."""
+        source = self.tmp / "source"
+        for folder in ("MyAddon", "MyAddon_Config"):
+            d = source / folder
+            d.mkdir(parents=True)
+            (d / f"{folder}.toc").write_text(
+                "## Interface: 11111\n## Version: @project-version@\n")
+        flavor = make_flavor(self.tmp / "wow", version="2.5.6")  # interface 20506
+        u.install_addon(
+            {"strategy": "github-branch", "package_as": "MyAddon"},
+            source, flavor, "2026-01-01.abc1234",
+            previous_folders=[])
+        for folder in ("MyAddon", "MyAddon_Config"):
+            toc = (flavor.addons_dir / folder / f"{folder}.toc").read_text()
+            self.assertIn("## Interface: 20506", toc, folder)
+            self.assertIn("## Version: 2026-01-01.abc1234", toc, folder)
+            self.assertNotIn("@project-version@", toc, folder)
+
+    def test_version_with_backslash_is_written_literally(self):
+        """A4: a version string with regex-special characters must be written
+        verbatim (function replacement, no backslash interpretation)."""
+        addon = self.tmp / "Addon"
+        addon.mkdir()
+        (addon / "Addon.toc").write_text("## Version: @project-version@\n")
+        u.patch_toc(addon, 20506, r"a\1b")
+        self.assertIn(r"## Version: a\1b", (addon / "Addon.toc").read_text())
+
+
 class InstallTransactionTest(TempDirTestCase):
     def test_install_removes_obsolete_tracked_folders(self):
         source = make_package(self.tmp, folders=("Addon",))
@@ -343,6 +374,15 @@ class VersionResolutionTest(TempDirTestCase):
                 u.resolve_github_source(
                     {"repo": "a/b", "tag_pattern": r"release-(.+)"})
 
+    def test_tag_pattern_without_capture_group_raises_clear_error(self):
+        """A3: a tag_pattern with no capture group must raise a clear ValueError
+        instead of an IndexError from m.group(1)."""
+        tags = [{"name": "v1.2.3", "zipball_url": "z"}]
+        with mock.patch.object(u, "http_json", return_value=tags):
+            with self.assertRaisesRegex(ValueError, "capture group"):
+                u.resolve_github_source(
+                    {"repo": "a/b", "tag_pattern": r"v[\d.]+"})
+
 
 class FailureReportingTest(TempDirTestCase):
     def setUp(self):
@@ -359,6 +399,18 @@ class FailureReportingTest(TempDirTestCase):
             with redirect_stdout(io.StringIO()):
                 counts = u.update_flavor(
                     self.flavor, self.registry, {}, self.tmp, dry_run=False)
+        self.assertEqual(counts["failed"], 1)
+
+    def test_bad_asset_regex_is_reported_not_raised(self):
+        """A2: a malformed asset regex (re.error) must be caught and reported as
+        a per-addon failure, not crash the whole run."""
+        registry = {"Addon": {"strategy": "github-release", "repo": "a/b",
+                              "asset": "("}}  # unbalanced -> re.error
+        release = {"tag_name": "v1", "assets": []}
+        with mock.patch.object(u, "http_json", return_value=release):
+            with redirect_stdout(io.StringIO()):
+                counts = u.update_flavor(
+                    self.flavor, registry, {}, self.tmp, dry_run=False)
         self.assertEqual(counts["failed"], 1)
 
     def test_main_returns_nonzero_when_update_fails(self):

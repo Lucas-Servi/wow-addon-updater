@@ -5,9 +5,8 @@
     "asset": "^Questie-v[\\d.]+\\.zip$"
   },
   "Auctionator": {
-    "strategy": "github-branch",
-    "repo": "TheMouseNest/Auctionator",
-    "branch": "master",
-    "package_as": "Auctionator"
+    "strategy": "github-release",
+    "repo": "curseforge-mirror/auctionator",
+    "asset": "^Auctionator-\\d+-\\d+-g[0-9a-f]+\\.zip$"
   }
 }

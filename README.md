@@ -170,8 +170,10 @@ no extra install) over the same commands:
 
 Move with the arrow keys or `j`/`k`, `space` to multi-select, then `u` to
 update, `r` to remove, or `p` to pin the selection; `c` checks GitHub for
-updates, and `/` opens a search-and-install prompt. Network actions run
-synchronously, so a slow download briefly pauses the UI.
+updates, `/` opens a search-and-install prompt, and `?` shows the full key list.
+Network actions (update, check, search, install) run on a background thread with
+a live progress spinner and can be cancelled with `Esc`, so the UI stays
+responsive during a slow download.
 
 ## Adding addons manually
 
@@ -244,8 +246,6 @@ Any entry may also carry `"pin": true` to hold it at its installed version
 - Addons are matched by their folder name in `Interface/AddOns`.
 - Pinning holds an addon at its **currently installed** version; it does not
   fetch a specific older release.
-- The TUI runs network actions synchronously, so a slow download briefly blocks
-  the UI.
 
 ## Roadmap
 

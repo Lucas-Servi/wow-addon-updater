@@ -15,10 +15,12 @@ Python 3.8+, standard library only.
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -291,6 +293,10 @@ def resolve_github_source(spec):
     """Return (version, zipball_url) for the newest tag matching spec['tag_pattern']."""
     tags = http_json(f"https://api.github.com/repos/{spec['repo']}/tags?per_page=100")
     pattern = re.compile(spec["tag_pattern"])
+    if pattern.groups < 1:
+        raise ValueError(
+            f"tag_pattern must contain a capture group for the version, "
+            f"got {spec['tag_pattern']!r}")
     best = None
     for tag in tags:
         m = pattern.fullmatch(tag["name"])
@@ -395,8 +401,10 @@ def patch_toc(addon_dir, interface, version):
         m = re.search(r"^## Interface:(.*)$", text, flags=re.MULTILINE)
         if interface and m and str(interface) not in m.group(1):
             text = text.replace(m.group(0), f"## Interface: {interface}")
+        # A function replacement avoids re.sub interpreting backslashes/group
+        # references that could appear in a version string.
         text = re.sub(r"^## Version:.*(@[\w-]+@|AUTO_GENERATED_VERSION).*$",
-                      f"## Version: {version}", text, flags=re.MULTILINE)
+                      lambda _m: f"## Version: {version}", text, flags=re.MULTILINE)
         toc.write_text(text)
 
 
@@ -481,7 +489,10 @@ def install_addon(spec, source_dir, flavor, latest, previous_folders=()):
             staging = Path(staging)
             for folder in folders:
                 shutil.copytree(source_dir / folder, staging / folder)
-            patch_toc(staging / spec["package_as"], flavor.interface, latest)
+            # Patch every folder the package ships, not just package_as — a
+            # multi-folder addon (e.g. Foo + Foo_Config) has a .toc in each.
+            for folder in folders:
+                patch_toc(staging / folder, flavor.interface, latest)
             install(staging, flavor.addons_dir, folders, obsolete)
     else:
         install(source_dir, flavor.addons_dir, folders, obsolete)
@@ -583,7 +594,7 @@ def gather_status(flavors, registry, check=False, cache=None):
                 if name not in cache:
                     try:
                         cache[name] = (resolve_latest_version(spec), None)
-                    except (urllib.error.URLError, LookupError, ValueError, OSError) as e:
+                    except (urllib.error.URLError, LookupError, ValueError, OSError, re.error) as e:
                         cache[name] = (None, str(e))
                 latest, check_error = cache[name]
                 has_update = bool(latest) and latest != version
@@ -726,7 +737,7 @@ def update_flavor(flavor, registry, cache, workdir, dry_run, is_last=True):
                 cache[name] = fetch_addon(name, spec, workdir) if not dry_run else (
                     resolve_latest_version(spec), None)
             latest, source_dir = cache[name]
-        except (urllib.error.URLError, LookupError, ValueError, OSError) as e:
+        except (urllib.error.URLError, LookupError, ValueError, OSError, re.error) as e:
             counts["failed"] += 1
             row(GLYPH_FAIL, "red", name, c(f"fetch failed: {e}", "red"))
             continue
@@ -801,7 +812,7 @@ def save_search_results(items):
         path.parent.mkdir(parents=True, exist_ok=True)
         slim = [{"full_name": r["full_name"],
                  "default_branch": r.get("default_branch", "main")} for r in items]
-        path.write_text(json.dumps(slim))
+        atomic_write_json(path, slim)
     except OSError:
         pass  # a non-writable cache dir just disables `install <n>`, not search
 
@@ -1029,7 +1040,7 @@ def cmd_install(target, registry, registry_path, wow_roots, only_flavor, dry_run
                 latest, source_dir = resolve_latest_version(spec), None
             else:
                 latest, source_dir = fetch_addon(name, spec, Path(workdir))
-        except (urllib.error.URLError, LookupError, ValueError, OSError) as e:
+        except (urllib.error.URLError, LookupError, ValueError, OSError, re.error) as e:
             sys.exit(f"error: cannot fetch {name}: {e}")
 
         width = max(len(f.name) for f in flavors)
@@ -1202,15 +1213,27 @@ def run_tui(wow_roots, registry, registry_path):
         sys.exit("error: no WoW flavor with an Interface/AddOns folder found.")
 
     def app(stdscr):
-        curses.use_default_colors()
         pairs = {}
         if curses.has_colors():
+            # Prefer the terminal's default background (-1); some terminals
+            # don't support it and raise, so fall back to the standard black.
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
             spec = {"green": curses.COLOR_GREEN, "cyan": curses.COLOR_CYAN,
                     "red": curses.COLOR_RED, "yellow": curses.COLOR_YELLOW}
             for i, (nm, col) in enumerate(spec.items(), start=1):
-                curses.init_pair(i, col, -1)
-                pairs[nm] = curses.color_pair(i)
-        curses.curs_set(0)
+                try:
+                    curses.init_pair(i, col, bg)
+                    pairs[nm] = curses.color_pair(i)
+                except curses.error:
+                    pass
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
 
         def attr(style):
             if style == "dim":
@@ -1225,12 +1248,73 @@ def run_tui(wow_roots, registry, registry_path):
         status = "Press ? for keys"
         checked = False
 
-        def rebuild(check=False):
+        def apply_rows(new_rows, check):
             nonlocal rows, sel, marked, checked
-            rows = gather_status(flavors, registry, check=check)
+            rows = new_rows
             checked = check
             marked = {i for i in marked if i < len(rows)}
             sel = min(sel, max(0, len(rows) - 1))
+
+        def rebuild(check=False):
+            # Offline (check=False) is fast and safe on the main thread; the
+            # networked check path runs through run_worker instead.
+            apply_rows(gather_status(flavors, registry, check=check), check)
+
+        def run_worker(work, label):
+            """Run blocking `work()` in a thread; keep the UI live meanwhile.
+
+            `work(cancelled, report)` receives a `cancelled()` predicate it
+            should poll during long loops and a `report(msg)` callback to show
+            progress. Returns (result, cancelled_flag, error): result is work()'s
+            return value (None on error/cancel), and exactly one of cancelled or
+            error may be set. All curses drawing stays here on the main thread;
+            the worker only computes and reports strings.
+            """
+            nonlocal status
+            result_q = queue.Queue()
+            cancel = threading.Event()
+            progress = [label]   # latest message; read by the render loop only
+
+            def report(msg):
+                progress[0] = msg
+
+            def runner():
+                try:
+                    result_q.put(("ok", work(cancel.is_set, report)))
+                except BaseException as exc:  # surfaced to the main thread
+                    result_q.put(("err", exc))
+
+            worker = threading.Thread(target=runner, daemon=True)
+            worker.start()
+            spinner = "|/-\\"
+            tick = 0
+            stdscr.timeout(120)   # non-blocking getch; ~8 fps spinner
+            try:
+                while True:
+                    try:
+                        kind, payload = result_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        if kind == "ok":
+                            return payload, False, None
+                        return None, False, payload
+                    status = f"{spinner[tick % len(spinner)]} {progress[0]} — [esc] cancel"
+                    tick += 1
+                    draw()
+                    k = stdscr.getch()
+                    if k in (27, ord("q")):
+                        cancel.set()
+                        status = f"Cancelling {label}…"
+                        draw()
+                        worker.join()   # let it observe the flag and unwind
+                        try:
+                            result_q.get_nowait()   # discard late result
+                        except queue.Empty:
+                            pass
+                        return None, True, None
+            finally:
+                stdscr.timeout(-1)   # restore blocking input
 
         def prompt(win, label):
             """Read a line of text from the user at the bottom of the screen."""
@@ -1305,7 +1389,7 @@ def run_tui(wow_roots, registry, registry_path):
                     pass
             stdscr.addstr(maxy - 3, 1, "─" * (maxx - 2), curses.A_DIM)
             keys = ("[↑↓/jk] move  [space] mark  [u] update  [c] check  "
-                    "[r] remove  [p] pin  [/] search  [q] quit")
+                    "[r] remove  [p] pin  [/] search  [?] help  [q] quit")
             try:
                 stdscr.addstr(maxy - 2, 1, keys[:maxx - 2], curses.A_DIM)
                 stdscr.addstr(maxy - 1, 1, status[:maxx - 2])
@@ -1319,32 +1403,51 @@ def run_tui(wow_roots, registry, registry_path):
 
         def do_update(indices):
             nonlocal status
-            done, failed = 0, 0
-            with tempfile.TemporaryDirectory(prefix="wow-addon-updater-") as wd:
-                fetch_cache = {}
-                for idx in indices:
-                    r = rows[idx]
-                    spec = registry.get(r["name"])
-                    if not spec or spec.get("pin"):
-                        continue
-                    status = f"Updating {r['name']}…"
-                    draw()
-                    try:
-                        if r["name"] not in fetch_cache:
-                            fetch_cache[r["name"]] = fetch_addon(r["name"], spec, Path(wd))
-                        latest, source_dir = fetch_cache[r["name"]]
-                        flavor = r["flavor_obj"]
-                        state = load_state(flavor.addons_dir)
-                        previous = state.get(r["name"], {}).get("folders", [])
-                        folders = install_addon(spec, source_dir, flavor, latest, previous)
-                        updated_state = dict(state)
-                        updated_state[r["name"]] = {
-                            "version": latest, "folders": folders}
-                        save_state(flavor.addons_dir, updated_state)
-                        done += 1
-                    except (urllib.error.URLError, LookupError, ValueError, OSError):
-                        failed += 1
-            status = f"Updated {done}" + (f", {failed} failed" if failed else "")
+            # Snapshot the (name, spec, flavor) work list on the main thread so
+            # the worker never touches `rows` while it may be shifting.
+            jobs = []
+            for idx in indices:
+                r = rows[idx]
+                spec = registry.get(r["name"])
+                if not spec or spec.get("pin"):
+                    continue
+                jobs.append((r["name"], spec, r["flavor_obj"]))
+
+            def work(cancelled, report):
+                done, failed, last_error = 0, 0, None
+                with tempfile.TemporaryDirectory(prefix="wow-addon-updater-") as wd:
+                    fetch_cache = {}
+                    for name, spec, flavor in jobs:
+                        if cancelled():
+                            break
+                        report(f"Updating {name}…")
+                        try:
+                            if name not in fetch_cache:
+                                fetch_cache[name] = fetch_addon(name, spec, Path(wd))
+                            latest, source_dir = fetch_cache[name]
+                            state = load_state(flavor.addons_dir)
+                            previous = state.get(name, {}).get("folders", [])
+                            folders = install_addon(spec, source_dir, flavor, latest, previous)
+                            updated_state = dict(state)
+                            updated_state[name] = {"version": latest, "folders": folders}
+                            save_state(flavor.addons_dir, updated_state)
+                            done += 1
+                        except (urllib.error.URLError, LookupError, ValueError,
+                                OSError, re.error) as e:
+                            failed += 1
+                            last_error = f"{name}: {e}"
+                return done, failed, last_error
+
+            result, cancelled, error = run_worker(work, "Updating")
+            if cancelled:
+                status = "Update cancelled"
+            elif error:
+                status = f"Update failed: {error}"
+            else:
+                done, failed, last_error = result
+                status = f"Updated {done}" + (f", {failed} failed" if failed else "")
+                if last_error:
+                    status += f" — {last_error}"
             marked.clear()
             rebuild()
 
@@ -1383,12 +1486,16 @@ def run_tui(wow_roots, registry, registry_path):
             query = prompt(stdscr, "Search GitHub: ")
             if not query:
                 return
-            status = f"Searching {query}…"
-            draw()
-            try:
-                items, _ = search_github_addons(query, 10)
-            except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as e:
-                status = f"Search failed: {e}"
+
+            def search_work(cancelled, report):
+                return search_github_addons(query, 10)[0]
+
+            items, cancelled, error = run_worker(search_work, f"Searching {query}")
+            if cancelled:
+                status = "Cancelled"
+                return
+            if error:
+                status = f"Search failed: {error}"
                 return
             if not items:
                 status = "No results"
@@ -1423,36 +1530,79 @@ def run_tui(wow_roots, registry, registry_path):
             repo = items[pick]
             name = repo["full_name"].split("/")[-1]
             spec = registry.get(name) or suggest_registry_spec(repo)
-            status = f"Installing {name}…"
-            draw()
-            try:
+
+            def install_work(cancelled, report):
+                report(f"Installing {name}…")
                 with tempfile.TemporaryDirectory(prefix="wow-addon-updater-") as wd:
                     latest, source_dir = fetch_addon(name, spec, Path(wd))
-                    installed, failed = 0, 0
+                    installed, failed, last_error = 0, 0, None
                     for flavor in flavors:
+                        if cancelled():
+                            break
+                        report(f"Installing {name} → {flavor.name}…")
                         try:
                             state = load_state(flavor.addons_dir)
                             previous = state.get(name, {}).get("folders", [])
                             folders = install_addon(
                                 spec, source_dir, flavor, latest, previous)
                             updated_state = dict(state)
-                            updated_state[name] = {
-                                "version": latest, "folders": folders}
+                            updated_state[name] = {"version": latest, "folders": folders}
                             save_state(flavor.addons_dir, updated_state)
                             installed += 1
-                        except (OSError, ValueError):
+                        except (OSError, ValueError) as e:
                             failed += 1
+                            last_error = f"{flavor.name}: {e}"
                     if name not in registry and installed:
                         updated_registry = dict(registry)
                         updated_registry[name] = spec
                         save_registry(updated_registry, registry_path)
                         registry[name] = spec
+                return latest, installed, failed, last_error
+
+            result, cancelled, error = run_worker(install_work, f"Installing {name}")
+            if cancelled:
+                status = f"Install of {name} cancelled"
+            elif error:
+                status = f"Install failed: {error}"
+            else:
+                latest, installed, failed, last_error = result
                 status = f"Installed {name} {latest} into {installed} flavor(s)"
                 if failed:
                     status += f", {failed} failed"
-            except (urllib.error.URLError, LookupError, ValueError, OSError) as e:
-                status = f"Install failed: {e}"
+                    if last_error:
+                        status += f" — {last_error}"
             rebuild()
+
+        def show_help():
+            """Overlay the key bindings until any key is pressed."""
+            lines = [
+                "wow-addon-updater — keys",
+                "",
+                "  ↑ / k        move up",
+                "  ↓ / j        move down",
+                "  space        mark / unmark row",
+                "  u            update selection",
+                "  c            check GitHub for updates",
+                "  r            remove selection",
+                "  p            pin / unpin selection",
+                "  /            search GitHub and install",
+                "  ?            this help",
+                "  q / Esc      quit",
+                "",
+                "Actions apply to marked rows, or the cursor row if none.",
+                "",
+                "Press any key to return.",
+            ]
+            stdscr.erase()
+            maxy, maxx = stdscr.getmaxyx()
+            for i, text in enumerate(lines[:maxy - 1]):
+                a = curses.A_BOLD if i == 0 else curses.A_DIM
+                try:
+                    stdscr.addstr(i, 1, text[:maxx - 2], a)
+                except curses.error:
+                    pass
+            stdscr.refresh()
+            stdscr.getch()
 
         draw()
         while True:
@@ -1467,10 +1617,16 @@ def run_tui(wow_roots, registry, registry_path):
                 if rows:
                     marked.symmetric_difference_update({sel})
             elif k == ord("c"):
-                status = "Checking for updates…"
-                draw()
-                rebuild(check=True)
-                status = "Update check complete"
+                def check_work(cancelled, report):
+                    return gather_status(flavors, registry, check=True)
+                new_rows, cancelled, error = run_worker(check_work, "Checking for updates")
+                if cancelled:
+                    status = "Check cancelled"
+                elif error:
+                    status = f"Check failed: {error}"
+                else:
+                    apply_rows(new_rows, True)
+                    status = "Update check complete"
             elif k == ord("u"):
                 if rows:
                     do_update(targets())
@@ -1482,6 +1638,8 @@ def run_tui(wow_roots, registry, registry_path):
                     do_pin(targets())
             elif k == ord("/"):
                 do_search()
+            elif k == ord("?"):
+                show_help()
             elif k == curses.KEY_RESIZE:
                 pass
             draw()
