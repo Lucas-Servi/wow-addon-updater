@@ -7,6 +7,11 @@
   "Auctionator": {
     "strategy": "github-release",
     "repo": "curseforge-mirror/auctionator",
-    "asset": "^Auctionator-\\d+-\\d+-g[0-9a-f]+\\.zip$"
+    "asset": "^Auctionator-\\d+-classic\\.zip$"
+  },
+  "AtlasLootClassic": {
+    "strategy": "github-release",
+    "repo": "Hoizame/AtlasLootClassic",
+    "asset": "^AtlasLootClassic\\-v[\\d.]+\\.zip$"
   }
 }

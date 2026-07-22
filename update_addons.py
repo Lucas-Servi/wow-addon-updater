@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -64,6 +65,15 @@ def c(text, *styles):
         return text
     codes = ";".join(_ANSI[s] for s in styles)
     return f"\033[{codes}m{text}\033[0m"
+
+
+def format_size(n):
+    """Render a byte count as e.g. '1.4 MB'; some addon zips run 50+ MB."""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
 
 
 def highlight_json(text):
@@ -211,10 +221,20 @@ def http_json(url):
         return json.load(resp)
 
 
-def http_download(url, dest):
+def http_download(url, dest, on_progress=None):
+    """Stream url to dest. If given, on_progress(downloaded_bytes, total_bytes_or_None)
+    is called after every chunk so slow, large downloads (some addon zips run
+    50+ MB) can show they're still moving instead of sitting silent."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as f:
-        shutil.copyfileobj(resp, f)
+        total = resp.getheader("Content-Length")
+        total = int(total) if total is not None else None
+        downloaded = 0
+        while chunk := resp.read(65536):
+            f.write(chunk)
+            downloaded += len(chunk)
+            if on_progress:
+                on_progress(downloaded, total)
 
 
 def safe_extract(zip_path, dest):
@@ -343,7 +363,7 @@ def pkgmeta_ignores(addon_dir):
     return ignores
 
 
-def fetch_addon(name, spec, workdir):
+def fetch_addon(name, spec, workdir, on_progress=None):
     """Download and extract an addon once per run.
 
     Returns (version, source_dir) where source_dir contains the addon's
@@ -361,7 +381,7 @@ def fetch_addon(name, spec, workdir):
 
     zip_path = workdir / f"{name}.zip"
     extract_dir = workdir / name
-    http_download(url, zip_path)
+    http_download(url, zip_path, on_progress=on_progress)
     extract_dir.mkdir()
     safe_extract(zip_path, extract_dir)
 
@@ -720,7 +740,11 @@ def update_flavor(flavor, registry, cache, workdir, dry_run, is_last=True):
               "pinned": 0, "failed": 0, "skipped": 0}
 
     def row(glyph, style, name, detail):
-        print(f"   {c(glyph, style)} {c(name.ljust(width), 'bold')}  {detail}")
+        # \r + clear-line erases a "…  working…" progress line left by the
+        # network call below, so the final status overwrites it in place
+        # instead of leaving stale text before it (only meaningful on a tty).
+        prefix = "\r\033[K" if COLOR else ""
+        print(f"{prefix}   {c(glyph, style)} {c(name.ljust(width), 'bold')}  {detail}")
 
     def change(old, new, new_style):
         return f"{c(old, 'dim')} {c('→', 'dim')} {c(new, new_style)}"
@@ -734,8 +758,10 @@ def update_flavor(flavor, registry, cache, workdir, dry_run, is_last=True):
             continue
         try:
             if name not in cache:
-                cache[name] = fetch_addon(name, spec, workdir) if not dry_run else (
-                    resolve_latest_version(spec), None)
+                # Cheap metadata-only check first: most addons are already
+                # current most runs, and some zips run 50+ MB, so we don't
+                # want to pay for the actual download until we know it's needed.
+                cache[name] = (resolve_latest_version(spec), None)
             latest, source_dir = cache[name]
         except (urllib.error.URLError, LookupError, ValueError, OSError, re.error) as e:
             counts["failed"] += 1
@@ -750,6 +776,36 @@ def update_flavor(flavor, registry, cache, workdir, dry_run, is_last=True):
             counts["available"] += 1
             row(GLYPH_UP, "cyan", name, change(current, latest, "cyan"))
             continue
+
+        if source_dir is None:
+            try:
+                if COLOR:
+                    print(f"   {c('…', 'dim')} {name.ljust(width)}  {c('working…', 'dim')}",
+                          end="", flush=True)
+                last_update = 0.0
+
+                def on_progress(downloaded, total, _name=name):
+                    # On a slow link a large zip can take minutes with nothing
+                    # else printed, which reads as a hang. Throttled so a
+                    # ~65 KB chunk callback doesn't flood stdout.
+                    nonlocal last_update
+                    if not COLOR:
+                        return
+                    now = time.monotonic()
+                    if now - last_update < 0.15 and downloaded != total:
+                        return
+                    last_update = now
+                    detail = (f"{format_size(downloaded)} / {format_size(total)}"
+                              if total else format_size(downloaded))
+                    print(f"\r   {c('…', 'dim')} {_name.ljust(width)}  {c(detail, 'dim')}\033[K",
+                          end="", flush=True)
+
+                latest, source_dir = fetch_addon(name, spec, workdir, on_progress=on_progress)
+                cache[name] = (latest, source_dir)
+            except (urllib.error.URLError, LookupError, ValueError, OSError, re.error) as e:
+                counts["failed"] += 1
+                row(GLYPH_FAIL, "red", name, c(f"fetch failed: {e}", "red"))
+                continue
 
         try:
             previous = state.get(name, {}).get("folders", [])
